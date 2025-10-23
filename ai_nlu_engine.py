@@ -2,6 +2,7 @@ import os
 from utils import log
 import pandas as pd
 from keybert import KeyBERT
+import json
 
 # 오프라인 허용 (모델이 로컬에 있을 때)
 os.environ['HF_HUB_DISABLE_SYMLINKS_WARNING'] = '1'
@@ -11,171 +12,105 @@ from transformers import pipeline, AutoTokenizer, AutoModelForSequenceClassifica
 import re
 import torch
 
+"""
+    범용 제어 시스템 NLU 엔진
+
+    역할:
+        - 음성 인식 텍스트를 구조화된 JSON 명령으로 변환
+        - Zero-Shot Classification (AI 기반 의미 분류)
+        - 패턴 매칭 (정규식 기반 빠른 추출)
+"""
 class UniversalNluEngine:
-    """범용 제어 시스템 NLU 엔진"""
+    MAX_LENGTH = 128
+    """
+        NLU 엔진 초기화
+
+        수행 작업:
+            1. Command Hypotheses 정의 (AI 분류용 가설 문장)
+            2. XLM-RoBERTa XNLI 모델 로드 (다국어 NLI)
+            3. KeyBERT 키워드 추출기 초기화
+
+        설정:
+            - 모델: XLM-RoBERTa Large + XNLI
+            - 키워드 추출: KeyBERT (다국어 지원)
+            - 잡음 필터: 한국어 불용어 리스트
+    """
     def __init__(self):
-        # 지원하는 명령 타입
-        self.COMMAND_TYPES = [
-            "control", "broadcast", "log", "read", "write"
-        ]
-
-        # 레이블 → 가설문 매핑
-        self.HYP_DETAILED = {
-            "ALERT": {
-                "description": "사용자 또는 관리자에게 경고, 알림, 비상 상황을 알리는 방송이나 메시지 전송을 지시합니다.",
-                "examples": [
-                    "침수 위험 경보를 발령하라.",
-                    "관리자에게 즉시 문자 알림을 보내.",
-                    "비상 방송 시스템을 작동시켜라.",
-                    "사이렌을 울려."
-                ],
-                "action_verbs": ["알리다", "경보하다", "방송하다", "발령하다", "전송하다", "보내다", "울리다"],
-                "target_objects": ["경보", "알림", "비상 방송", "사이렌", "안내 방송", "관리자", "사용자"]
-            },
-
-            "LOG": {
-                "description": "현재 상태, 특정 이벤트 발생, 센서 데이터 값 등을 시스템 로그 파일이나 데이터베이스에 기록(저장)하라는 지시입니다.",
-                "examples": [
-                    "현재 수위를 로그에 기록해.",
-                    "모든 센서 값을 데이터베이스에 저장해.",
-                    "펌프 작동 이벤트 로그를 남겨라."
-                ],
-                "action_verbs": ["기록하다", "저장하다", "로그를 남기다", "쓰다"],
-                "target_objects": ["로그", "데이터", "이벤트", "현재 상태", "값", "파일", "DB"]
-            },
-
-            "DO": {
-                "description": "디지털 출력(DO) 포트를 제어하여 특정 장치(예: 릴레이, 펌프, 밸브)를 켜거나(ON) 끄는(OFF) 동작을 지시합니다.",
-                "examples": [
-                    "1번 펌프를 켜라.",
-                    "밸브 3번을 닫아.",
-                    "DO 2번 포트 OFF 시켜.",
-                    "경광등을 작동시켜라."
-                ],
-                "action_verbs": ["켜다", "끄다", "작동시키다", "정지시키다", "열다", "닫다", "ON", "OFF"],
-                "target_objects": ["펌프", "밸브", "릴레이", "모터", "팬", "경광등", "DO 포트"]
-            },
-            "DI": {
-                "description": "디지털 입력(DI) 포트의 현재 상태(ON/OFF, High/Low)를 확인하거나 읽어오라는 지시입니다.",
-                "examples": [
-                    "1번 스위치 상태 확인해.",
-                    "DI 3번 입력 값이 뭐야?",
-                    "문 열림 센서가 감지됐는지 알려줘.",
-                    "비상 정지 버튼이 눌렸어?"
-                ],
-                "action_verbs": ["확인하다", "읽다", "상태를 보다", "감지하다", "입력값"],
-                "target_objects": ["스위치", "센서", "버튼", "문 열림", "DI 포트", "입력 상태"]
-            },
-            "AO": {
-                "description": "아날로그 출력(AO) 포트를 통해 특정 전압이나 전류(예: 0-10V, 4-20mA) 값을 설정하거나 제어하라는 지시입니다.",
-                "examples": [
-                    "AO 1번 포트에 5V를 출력해.",
-                    "밸브 개방도를 50%로 설정해.",
-                    "아날로그 출력으로 모터 속도를 80%로 조절해."
-                ],
-                "action_verbs": ["출력하다", "설정하다", "제어하다", "조절하다", "맞추다", "보내다"],
-                "target_objects": ["전압", "전류", "밸브 개방도", "모터 속도", "AO 포트", "출력값", "퍼센트"]
-            },
-            "AI": {
-                "description": "아날로그 입력(AI) 포트에 연결된 센서의 현재 값(전압, 전류, 또는 변환된 물리량)을 읽어오라는 지시입니다.",
-                "examples": [
-                    "AI 2번 포트 값 읽어와.",
-                    "현재 온도 센서 값 몇 도야?",
-                    "압력 센서가 측정한 값이 뭐야?",
-                    "아날로그 입력 1번 채널 전압 확인해."
-                ],
-                "action_verbs": ["읽다", "확인하다", "측정하다", "값을 가져오다", "알려주다"],
-                "target_objects": ["온도 센서", "압력 센서", "전압값", "전류값", "AI 포트", "센서 값", "측정값"]
-            },
-
-            "COM": {
-                "description": "시리얼 포트(RS-232, 485)나 특정 통신 채널(TCP/IP)을 통해 데이터를 전송하거나 수신하라는 지시입니다.",
-                "examples": [
-                    "COM1 포트로 'START' 문자열을 보내.",
-                    "RS485 통신을 통해 외부 장치 값을 읽어와.",
-                    "시리얼 통신 연결을 확인해."
-                ],
-                "action_verbs": ["전송하다", "보내다", "수신하다", "읽다", "쓰다", "연결하다", "확인하다"],
-                "target_objects": ["COM 포트", "시리얼", "RS485", "RS232", "데이터", "문자열", "외부 장치"]
-            },
-
-            # "WATERLEVEL": {
-            #     "description": "수위 센서의 현재 값(수위 높이)을 묻거나, 특정 수위 값과 관련된 동작(예: 펌프 제어)을 지시합니다.",
-            #     "examples": [
-            #         "현재 저수지 수위 몇 미터야?",
-            #         "수위가 3m를 넘으면 1번 펌프를 켜.",
-            #         "수위 센서 값 실시간으로 알려줘."
-            #     ],
-            #     "action_verbs": ["읽다", "확인하다", "측정하다", "알려주다", "...이면 ...해라"],
-            #     "target_objects": ["수위", "수위값", "수위 센서", "수위계", "저수지", "수조"]
-            # },
-            # "RAINFALL": {
-            #     "description": "우량계(강수량 센서)가 측정한 값(누적 강우, 시간당 강우 등)을 묻는 지시입니다.",
-            #     "examples": [
-            #         "오늘 누적 강수량이 얼마야?",
-            #         "시간당 강우량 알려줘.",
-            #         "우량 센서 값 좀 읽어와."
-            #     ],
-            #     "action_verbs": ["읽다", "확인하다", "측정하다", "알려주다"],
-            #     "target_objects": ["강수량", "강우량", "누적 강수량", "시간당 강우량", "우량계", "강수 센서"]
-            # },
-            # "BATTERY_VOLTAGE": {
-            #     "description": "시스템의 주 전원 또는 배터리의 현재 전압 값이나 전원 상태(잔량)를 묻는 지시입니다.",
-            #     "examples": [
-            #         "배터리 전압 몇 볼트 남았어?",
-            #         "현재 전원 상태 어때?",
-            #         "배터리 잔량 확인해 줘.",
-            #         "UPS 전압 체크해 봐."
-            #     ],
-            #     "action_verbs": ["확인하다", "읽다", "알려주다", "체크하다", "측정하다"],
-            #     "target_objects": ["배터리", "전압", "배터리 전압", "전원 상태", "잔량", "UPS"]
-            # }
+        self.SCENARIO_TO_FILE = {
+            "시험": "A.wav",
+            "방류": "B.wav",
         }
 
-        # 구분 타입
-        self.what_TYPES = {
-            # 긴급 시, 경보 후 로그 남기기
-            "ALERT": [
-                "경보", "경고", "알람", "비상", "긴급", "alert", "alarm",
-                "사이렌", "경고음", "비상신호", "경보방송", "경보등", "경보발생", "alert signal"
-            ],
-            "LOG": [
-                "로그", "기록", "저장", "log", "history", "데이터기록", "이력남기기", "log save", "log record"
-            ],
+        # Command 레벨 가설 상세
+        # Command 레벨 가설 상세
+        self.COMMAND_HYPOTHESES = {
+            # 1) 경보 방송
+            "alert.broadcast": {
+                "description": "경보국 방송 수행. 시나리오(시험/방류)와 볼륨을 슬롯으로 추출.",
+                "examples": [
+                    "경보국 볼륨 1로 시험 방송 시작",
+                    "경보국 볼륨 제일 작게 시험 방송 시작",
+                    "경보국 볼륨 30으로 방류 방송해줘",
+                    "경보국 시험 방송 시작",
+                    "방류 안내 방송 송출",
+                ],
+                "keywords": ["경보", "방송", "안내", "재생", "송출", "시험", "테스트", "방류", "경보국"],
+                "slots": {
+                    "scenario": ["시험", "방류", "테스트"],
+                    "volume": list(range(0, 101)),
+                    "action": ["시작", "정지", "중단", "켜기", "끄기"],
+                },
+                "slot_patterns": {
+                    "scenario": r"(시험|방류|테스트)",
+                    "volume": r"(?:볼륨|volume)\s*(\d{1,3})",
+                    "action": r"(시작|정지|중단|켜|꺼)",
+                },
+                "defaults": {"station": "경보국", "volume": 10, "action": "시작"}
+            },
 
-            # 기본 I/O
-            "DO": ["do", "디오", "디지털 출력", "digital output"],
-            "DI": ["di", "디아이", "디지털 입력", "digital input"],
-            "AO": ["ao", "에이오", "아날로그 출력", "analog output"],
-            "AI": ["ai", "에이아이", "아날로그 입력", "analog input"],
+            # 2) 수위국 데이터 호출
+            "data.fetch.level": {
+                "description": "수위국의 수위, 우량, 배터리 전압 데이터를 조회해 응답.",
+                "examples": [
+                    "부천 수위국 데이터 호출해줘",
+                    "수위국 데이터 가져와",
+                    "부천 수위, 우량, 배터리 전압 조회",
+                    "수위국 값 불러와"
+                ],
+                "keywords": ["수위국", "데이터", "호출", "가져와", "조회", "불러와", "수위", "우량", "배터리"],
+                "slots": {
+                    "station": ["수위국", "우량국"],
+                    "data_type": ["수위", "우량", "배터리전압", "전체"],
+                },
+                "slot_patterns": {
+                    "station": r"(수위국|우량국)",
+                    "data_type": r"(수위|우량|배터리\s*전압)",
+                },
+                "defaults": {"station": "수위국", "data_type": "전체"}
+            },
 
-            # 통신 상태
-            # "COM": ["uart", "com", "시리얼", "serial", "통신포트", "포트상태", "통신연결", "tx", "rx"],
-
-            # 센서
-            # "WATERLEVEL": [
-            #     "수위", "waterlevel", "수위센서", "level", "water level",
-            #     "수위값", "수위측정", "저수위", "고수위", "water sensor"
-            # ],
-            # "RAINFALL": [
-            #     "우량", "rainfall", "rain", "비", "강수", "강우", "rain sensor",
-            #     "우량센서", "강수량", "rain gauge", "rain data"
-            # ],
-            # "BATTERY_VOLTAGE": [
-            #     "배터리 전압", "batteryvoltage", "배터리", "전압", "전원전압",
-            #     "배터리 상태", "battery voltage", "battery level", "전원상태",
-            #     "battery sensor", "전압값"
-            # ]
+            # 3) 장비 점검
+            "device.inspect": {
+                "description": "지정 국의 장비·센서 상태 점검 후 이상 여부 리포트.",
+                "examples": [
+                    "울산 경보국 장비 점검해줘",
+                    "부천 경보국 점검",
+                    "경보국 장비 상태 체크",
+                    "장비 진단 실행"
+                ],
+                "keywords": ["점검", "진단", "체크", "검사", "장비", "상태", "경보국", "수위국"],
+                "slots": {
+                    "station": ["경보국", "수위국"],
+                },
+                "slot_patterns": {
+                    "station": r"(경보국|수위국)",
+                },
+                "defaults": {"station": "경보국"}
+            },
         }
-
-        self.ACTION_ON = ["켜", "켜줘", "on", "start", "활성", "활성화", "작동"]
-        self.ACTION_OFF = ["꺼", "꺼줘", "끄", "off", "stop", "비활성", "비활성화", "정지"]
-        self.ACTION_READ = ["읽", "read", "조회", "확인", "가져와"]
-        self.ACTION_WRITE = ["쓰", "write", "설정", "세팅", "변경", "바꿔"]
-        self.ACTION_QUERY = ["상태", "status", "어때", "어떻게", "query"]
 
         # 잡음 키워드
-        self.NOISE = ["야", "음", "어", "으", "아", "이제", "좀", "약간", "그", "저", "뭐", "뭐시기",
+        self.NOISE = ["음", "어", "으", "아", "이제", "좀", "약간", "그", "저", "뭐", "뭐시기",
                       "그거", "저거", "이거", "있잖아", "있잖아요", "요", "잠깐", "빨리"]
 
 
@@ -183,22 +118,280 @@ class UniversalNluEngine:
         model_dir = r"D:\models\xlmR_xnli"
 
         # 옵션 2: 한국어 특화 모델 (KoBERT 기반)
+        # Zero-Shot Classification 파이프라인 생성
         self.classifier = pipeline(
-            "zero-shot-classification",
-            model=AutoModelForSequenceClassification.from_pretrained(model_dir, local_files_only=True),
-            tokenizer=AutoTokenizer.from_pretrained(model_dir, local_files_only=True, use_fast=True),
+            "zero-shot-classification",               # 작업 타입: 제로샷 분류
+            model=AutoModelForSequenceClassification.from_pretrained(
+                model_dir,                                 # 모델 경로
+                local_files_only=True                      # 로컬 파일만 사용 (인터넷 차단)
+            ),
+            tokenizer=AutoTokenizer.from_pretrained(
+                model_dir,                                 # 토크나이저 경로
+                local_files_only=True,                     # 로컬 파일만 사용
+                use_fast=True                              # Rust 기반 Fast Tokenizer (2~3배 빠름)
+            ),
         )
 
+        # KeyBERT 키워드 추출기 초기화
+        # - 모델: DistilUSE (다국어 문장 임베딩)
+        # - 용도: 중요 키워드 자동 추출
         self.keyword_extractor = KeyBERT('distiluse-base-multilingual-cased-v2')
 
-        # HYP_DETAILED 검증
-        for label in self.what_TYPES.keys():
-            if label not in self.HYP_DETAILED:
-                log(f"⚠️ 경고: {label}에 대한 HYP_DETAILED 없음")
-
-        log("✅ HYP_DETAILED 검증 완료")
-
         log("✅ AI 모델 로딩 완료!")
+
+    """
+        상태 체크 타입 분류
+    
+        Returns:
+            "communication" | "power" | "all"
+    """
+    def _classify_check_type(self, text: str) -> str:
+        hypotheses = {
+            "communication": "이 명령은 통신 연결 상태나 네트워크 상태 확인입니다.",
+            "power": "이 명령은 전원 상태나 배터리 전압 확인입니다.",
+            "all": "이 명령은 전체 시스템 상태를 종합적으로 확인합니다."
+        }
+
+        return self._classify_with_hypotheses(text, hypotheses)
+
+    """
+        데이터 타입 분류
+    
+        Returns:
+            "waterlevel" | "rainfall" | "all"
+    """
+    def _classify_data_type(self, text: str) -> str:
+        hypotheses = {
+            "waterlevel": "이 명령은 수위 센서 데이터나 수위계 측정값과 관련됩니다.",
+            "rainfall": "이 명령은 강수량, 우량 데이터와 관련됩니다.",
+            "all": "이 명령은 모든 종류의 센서 데이터를 포함합니다."
+        }
+
+        return self._classify_with_hypotheses(text, hypotheses)
+
+    """
+        공통 분류 헬퍼 함수
+    
+        Args:
+            text: 입력 텍스트
+            hypotheses: {label: hypothesis} 딕셔너리
+    
+        Returns:
+            최고 점수 레이블
+    """
+    def _classify_with_hypotheses(self, text: str, hypotheses: dict) -> str:
+        tokenizer = self.classifier.tokenizer
+        model = self.classifier.model
+
+        scores = []
+
+        for label, hypothesis in hypotheses.items():
+            inputs = tokenizer(
+                text,
+                hypothesis,
+                return_tensors="pt",
+                truncation=True,
+                max_length=512
+            )
+
+            with torch.no_grad():
+                outputs = model(**inputs)
+                logits = outputs.logits[0]
+                probs = torch.softmax(logits, dim=0)
+                entailment_prob = probs[-1].item()
+
+            scores.append((label, entailment_prob))
+
+        scores.sort(key=lambda x: x[1], reverse=True)
+        return scores[0][0]
+
+    def _classify_intent(self, text: str):
+        """
+        Intent 분류: 사용자 입력을 COMMAND_HYPOTHESES의 Intent로 분류
+
+        Args:
+            text: 사용자 입력 텍스트
+
+        Returns:
+            str: 분류된 Intent (예: "alert.broadcast.start")
+        """
+        # 1단계: 키워드 기반 빠른 필터링
+        candidate_intents = []
+
+        for intent, config in self.COMMAND_HYPOTHESES.items():
+            # 키워드 매칭 점수 계산
+            keyword_match_count = sum(
+                1 for keyword in config["keywords"]
+                if keyword in text.lower()
+            )
+
+            if keyword_match_count > 0:
+                candidate_intents.append(intent)
+
+        # 키워드 매칭된 Intent가 없으면 전체 Intent 사용
+        if not candidate_intents:
+            candidate_intents = list(self.COMMAND_HYPOTHESES.keys())
+
+        log(f"  [Intent 후보] {candidate_intents}")
+
+        # 2단계: NLU 모델로 정확한 Intent 분류
+        intent_labels = [
+            self.COMMAND_HYPOTHESES[intent]["description"]
+            for intent in candidate_intents
+        ]
+
+        result = self.classifier(
+            text,
+            candidate_labels=intent_labels,
+            multi_label=False
+        )
+
+        # 결과를 DataFrame으로 보기 좋게 출력
+        df = pd.DataFrame({
+            'Intent': candidate_intents,
+            '설명': intent_labels,
+            '정확도': result['scores']
+        })
+        df = df.sort_values('정확도', ascending=False).reset_index(drop=True)
+        print(df)
+
+        # 가장 높은 확률의 Intent 반환
+        best_intent_idx = intent_labels.index(result['labels'][0])
+        selected_intent = candidate_intents[best_intent_idx]
+
+        log(f"  [선택된 Intent] {selected_intent}")
+        return selected_intent
+
+    def _extract_slot_with_regex(self, text: str, slot_name: str, pattern: str):
+        """
+        정규식으로 슬롯 추출 (1차 시도)
+
+        Args:
+            text: 사용자 입력 텍스트
+            slot_name: 슬롯 이름 (예: "scenario", "volume")
+            pattern: 정규식 패턴
+
+        Returns:
+            추출된 값 또는 None
+        """
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            value = match.group(1) if match.groups() else match.group(0)
+            log(f"    [정규식 성공] {slot_name} = {value}")
+            return value
+        return None
+
+    def _extract_slot_with_nlu(self, text: str, slot_name: str, candidates: list):
+        """
+        NLU 모델로 슬롯 추출 (2차 시도)
+
+        Args:
+            text: 사용자 입력 텍스트
+            slot_name: 슬롯 이름
+            candidates: 가능한 후보 값 리스트
+
+        Returns:
+            추출된 값 또는 None
+        """
+        # 특수 처리: volume 같은 숫자 슬롯
+        if slot_name == "volume":
+            # 텍스트에서 숫자 추출
+            numbers = re.findall(r'\d+', text)
+            if numbers:
+                value = int(numbers[0])
+                # 범위 체크 (0~100)
+                if 0 <= value <= 100:
+                    log(f"    [NLU-숫자] {slot_name} = {value}")
+                    return value
+
+            # "제일 작게", "최소", "최대" 같은 표현 처리
+            if any(kw in text for kw in ["제일 작게", "최소", "작게"]):
+                log(f"    [NLU-의미] {slot_name} = 1 (최소)")
+                return 1
+            if any(kw in text for kw in ["제일 크게", "최대", "크게"]):
+                log(f"    [NLU-의미] {slot_name} = 100 (최대)")
+                return 100
+
+            return None
+
+        # 일반 슬롯: NLU 분류
+        if not candidates or len(candidates) == 0:
+            return None
+
+        # 후보가 1개면 바로 반환
+        if len(candidates) == 1:
+            return candidates[0]
+
+        # 문자열 후보만 필터링 (NLU 입력용)
+        str_candidates = [str(c) for c in candidates if isinstance(c, str)]
+
+        if not str_candidates:
+            return None
+
+        try:
+            result = self.classifier(
+                text,
+                candidate_labels=str_candidates,
+                multi_label=False
+            )
+
+            value = result['labels'][0]
+            score = result['scores'][0]
+
+            # 신뢰도가 낮으면 무시 (threshold: 0.3)
+            if score < 0.3:
+                log(f"    [NLU-실패] {slot_name} 신뢰도 낮음 ({score:.2f})")
+                return None
+
+            log(f"    [NLU 성공] {slot_name} = {value} (신뢰도: {score:.2f})")
+            return value
+
+        except Exception as e:
+            log(f"    [NLU-오류] {slot_name}: {e}")
+            return None
+
+    def _extract_slots(self, text: str, intent: str):
+        """
+        Intent에 정의된 모든 슬롯 추출
+
+        Args:
+            text: 사용자 입력 텍스트
+            intent: 분류된 Intent
+
+        Returns:
+            dict: 추출된 슬롯들 {slot_name: value}
+        """
+        config = self.COMMAND_HYPOTHESES[intent]
+        slots = {}
+
+        log(f"  [슬롯 추출 시작] Intent: {intent}")
+
+        # 각 슬롯별로 추출 시도
+        for slot_name, candidates in config.get("slots", {}).items():
+            log(f"  [{slot_name}] 추출 시도...")
+
+            # 1차: 정규식 시도
+            pattern = config.get("slot_patterns", {}).get(slot_name)
+            if pattern:
+                value = self._extract_slot_with_regex(text, slot_name, pattern)
+                if value is not None:
+                    slots[slot_name] = value
+                    continue
+
+            # 2차: NLU 시도
+            value = self._extract_slot_with_nlu(text, slot_name, candidates)
+            if value is not None:
+                slots[slot_name] = value
+
+        # 기본값 적용
+        defaults = config.get("defaults", {})
+        for key, default_value in defaults.items():
+            if key not in slots:
+                slots[key] = default_value
+                log(f"    [기본값 적용] {key} = {default_value}")
+
+        log(f"  [최종 슬롯] {slots}")
+        return slots
 
     # 0. 잡음 처리
     def _preprocess(self, text: str) -> str:
@@ -210,7 +403,6 @@ class UniversalNluEngine:
         return re.sub(r'\s+', ' ', t).strip()
 
     def _extract_keywords(self, text: str, top_n: int = 5):
-        """문장에서 주요 키워드 추출 (명사, 행위어 등)"""
         text = self._preprocess(text)
         log(f"   잡음 제거 후 : {text}")
         keywords = self.keyword_extractor.extract_keywords(
@@ -223,394 +415,330 @@ class UniversalNluEngine:
         # [('경보국', 0.74), ('포트', 0.68)...] → ['경보국', '포트', ...]
         return [kw for kw, score in keywords]
 
-    def _build_hypothesis(self, label: str) -> str:
-        """
-        레이블에 맞는 상세한 가설 문장 생성
+    """
+        명령 타입 분류 (순수 AI)
 
         Args:
-            label: "DO", "ALERT" 같은 장치 코드
+            text: 사용자 입력 (예: "서버에서 상수도 데이터 호출해줘")
 
         Returns:
-            str: "이 문장은 디지털 출력(DO) 포트를 제어하여..."
-        """
-        if label not in self.HYP_DETAILED:
-            return f"이 문장은 {label}에 관한 지시다."
+            (command_type, confidence_score)
+            예: ("data.fetch", 0.92)
+    """
+    def _classify_command(self, text: str) -> tuple:
+        log("=" * 60)
+        log(f"[1단계: Command 분류] 입력: {text}")
+        log("=" * 60)
 
-        detail = self.HYP_DETAILED[label]
-
-        # description 활용
-        desc = detail["description"]
-
-        # examples 일부 추가 (선택 사항)
-        examples = detail["examples"][:2]  # 상위 2개만
-        example_text = " 예: " + ", ".join(examples) if examples else ""
-
-        return f"{desc}{example_text}"
-
-
-    # 1. (AI) 명령 Type 추론
-    def _classify_command_type(self, text: str):
-        """명령 타입 분류 (수정!)"""
-
-        # 1. control (장비 제어: 켜기/끄기/작동)
-        if any(kw in text for kw in ["켜", "꺼", "작동", "정지", "on", "off", "start", "stop", "activate", "deactivate"]):
-            return "control"
-
-        # 2. broadcast (방송 또는 알림 송출)
-        if any(kw in text for kw in ["방송", "안내", "송출", "출력", "재생", "broadcast", "announce", "play"]):
-            return "broadcast"
-
-        # 3. log (기록 또는 로그 조회)
-        if any(kw in text for kw in ["로그", "기록", "이력", "history", "log"]):
-            return "log"
-
-        # 4. read (값 조회 / 센서 데이터 읽기)
-        if any(kw in text for kw in ["읽어", "확인", "조회", "측정", "read", "measure", "get", "status"]):
-            return "read"
-
-        # 5. write (설정 변경 / 데이터 쓰기)
-        if any(kw in text for kw in ["설정", "변경", "입력", "저장", "쓰기", "write", "set", "update"]):
-            return "write"
-
-        # 기타: 부정확한 발음은 AI 분류기 사용
-        z = self.classifier(
-            text, candidate_labels=self.COMMAND_TYPES, multi_label=False
-        )
-
-        return z["labels"][0]
-
-
-    # 2. (AI) 무엇을 수행할지 추론
-    def _extract_what(self, text: str):
-        """
-        What 추출 (NLI 모델 직접 사용)
-
-        Args:
-            text: 사용자 입력 텍스트
-
-        Returns:
-            str: 장치 코드
-        """
-        text_lower = text.lower()
-
-        # 1단계: 키워드 체크
-        for what_code, keywords in self.what_TYPES.items():
-            if any(kw in text_lower for kw in keywords):
-                log(f"  [키워드 매칭] {what_code}")
-                return what_code
-
-        # 2단계: AI 분류 (직접 추론)
-        log("  [AI 분류 시작]")
-
-        # Tokenizer와 Model 직접 사용
+        # Tokenizer와 Model
         tokenizer = self.classifier.tokenizer
         model = self.classifier.model
 
         scores = []
 
-        for what_code in self.what_TYPES.keys():
-            # Hypothesis 생성
-            if what_code in self.HYP_DETAILED:
-                hypothesis = self.HYP_DETAILED[what_code]["description"]
-            else:
-                hypothesis = f"{what_code} 장치를 제어하는 명령이다."
+        for cmd_type, hypothesis_data in self.COMMAND_HYPOTHESES.items():
+            # Hypothesis 생성 (description + examples)
+            hypothesis = hypothesis_data["description"]
 
-            # Tokenization (premise, hypothesis 쌍)
+            # 예시 추가
+            examples = hypothesis_data["examples"]
+            if examples:
+                hypothesis += f" 예시: {' '.join(examples)}"
+
+            # NLI 추론
             inputs = tokenizer(
-                text,  # Premise (입력 텍스트)
-                hypothesis,  # Hypothesis (가설 문장)
-                return_tensors="pt",  # PyTorch 텐서로 반환
-                truncation=True,  # 긴 문장 자르기
-                max_length=512  # 최대 길이
+                text,
+                hypothesis,
+                return_tensors="pt",
+                truncation=True,
+                max_length=512,
+                padding=True
             )
 
-            # 모델 추론
-            with torch.no_grad():  # 기울기 계산 안 함 (속도 향상)
+            with torch.no_grad():
                 outputs = model(**inputs)
-                logits = outputs.logits[0]  # [contradiction, neutral, entailment]
+                logits = outputs.logits[0]
 
-            # Entailment 점수 추출 (마지막 인덱스)
-            entailment_score = torch.softmax(logits, dim=0)[-1].item()
+                # Softmax로 확률 변환
+                probs = torch.softmax(logits, dim=0)
+                entailment_prob = probs[-1].item()  # XNLI: 마지막 인덱스가 entailment
 
-            scores.append((what_code, entailment_score))
-            log(f"    {what_code}: {entailment_score:.4f}")
+            scores.append((cmd_type, entailment_prob))
 
-        # 3단계: 최고 점수 선택
+            log(f"  {cmd_type:20s} → {entailment_prob:.4f}")
+
+        # 최고 점수 선택
         scores.sort(key=lambda x: x[1], reverse=True)
-        best_label, best_score = scores[0]
+        best_cmd, best_score = scores[0]
 
-        log(f"  [AI 판정] {best_label} (확신도: {best_score:.2%})")
+        log(f"  ✅ 추론 : {best_cmd} (확신도: {best_score:.2%})")
+        log("=" * 60)
 
-        return best_label
+        return best_cmd, best_score
 
-    # def _extract_what(self, text: str):
-    #     """What 추출 (개선된 버전)"""
-    #     text_lower = text.lower()
-    #
-    #     # 명확하게 키워드가 있는 경우 즉시 return
-    #     for what_code, keywords in self.what_TYPES.items():
-    #         for keyword in keywords:
-    #             if keyword in text_lower:
-    #                 return what_code
-    #
-    #     # 음성 인식 등 명확하게 입력 받지 못한 경우 NLU model 동작
-    #     # 후보 중 의미적 유사도에 가까운 값을 반환
-    #
-    #     log(f"[NLU-INPUT] {text}")
-    #     log(f"[NLU-LABELS] {self.what_TYPES.keys()}")
-    #     candidate_labels = list(self.what_TYPES.keys())  # ["DO", "DI", "ALERT", ...]
-    #     log(f"[NLU-RAW] {candidate_labels}")
-    #
-    #     z = self.classifier(
-    #         text,
-    #         candidate_labels=candidate_labels,
-    #         hypothesis_template=[],
-    #         multi_label=True
-    #     )
-    #
-    #     df = pd.DataFrame({
-    #         '후보': z['labels'],
-    #         '정확도': z['scores']
-    #     })
-    #
-    #     # 점수 기준 내림차순 정렬
-    #     df = df.sort_values('정확도', ascending=False).reset_index(drop=True)
-    #     print(df)
-    #
-    #     return z["labels"][0]
+    """
+        명령 대상 범위 분류 (로컬/원격)
 
-    # 3. Target (write 타입) 추론
-    def _extract_value_for_write(self, text: str, numbers: list):
-        """write 명령용 값 추출"""
-        target_match = re.search(r'(\d+)\s*번', text)
-        target = int(target_match.group(1)) if target_match else numbers[0]
+        Args:
+            text: "서버에서 상수도 데이터 호출"
 
-        percent_match = re.search(r'(\d+(?:\.\d+)?)\s*%', text)
-        if percent_match:
-            value = float(percent_match.group(1)) / 100.0
-            return target, value
+        Returns:
+            "local" or "remote"
+    """
+    def _classify_target_scope(self, text: str) -> str:
+        log("=" * 60)
+        log(f"[2단계: Target Scope 분류]")
+        log("=" * 60)
 
-        value_match = re.search(r'(?:값|설정|세팅).*?(\d+(?:\.\d+)?)', text)
-        if value_match:
-            value = float(value_match.group(1))
-            if value > 1:
-                value = value / 100.0
-            return target, value
+        # Hypothesis 정의
+        target_hypotheses = {
+            "local": "이 명령은 현재 기기에서 직접 실행하는 로컬 작업입니다.",
+            "remote": "이 명령은 원격 서버나 다른 장소의 시스템에 요청하는 작업입니다."
+        }
 
-        return target, None
+        tokenizer = self.classifier.tokenizer
+        model = self.classifier.model
 
-    # O1. 다중 명령 처리
-    def _split_commands(self, text: str):
-        """여러 명령 분리"""
-        parts = re.split(r'((?:끄|켜|설정하|활성화하|비활성화하|읽)고)', text)
+        scores = []
 
-        commands = []
-        for i in range(0, len(parts) - 1, 2):
-            connector = parts[i + 1]
-            action_word = connector.replace("고", "")
-            cmd_text = (parts[i].strip() + " " + action_word).strip()
-            cmd_text = cmd_text.strip(',').strip()
+        for scope, hypothesis in target_hypotheses.items():
+            inputs = tokenizer(
+                text,                                  # premise: 사용자 원문 텍스트
+                hypothesis,                            # hypothesis: 레이블별 가설 문장
+                return_tensors="pt",                   # PyTorch 텐서로 반환
+                truncation=True,                       # 최대 길이를 초과하면 잘라낸다
+                max_length=self.MAX_LENGTH             # 문장쌍 총 길이 상한(모델 한계에 맞춤)
+            )
 
-            if cmd_text:
-                commands.append(cmd_text)
-                log(f"  [분리] '{cmd_text}'")
+            with torch.no_grad():                      # 추론 모드(gradient 비계산)로 메모리/속도 절약
+                outputs = model(**inputs)              # NLI 모델 전향 패스(forward) 호출
+                logits = outputs.logits[0]             # 배치 첫 항목의 로짓 벡터 취득
+                probs = torch.softmax(logits, dim=0)   # 로짓을 소프트맥스로 확률로 변환
+                entailment_prob = probs[-1].item()     # 마지막 인덱스를 함의(entailment)로 가정해 확률 추출
 
-        if len(parts) % 2 == 1:
-            last_cmd = parts[-1].strip().strip(',').strip()
-            if last_cmd:
-                commands.append(last_cmd)
-                log(f"  [분리] '{last_cmd}'")
+            scores.append((scope, entailment_prob))
+            log(f"  {scope:10s} → {entailment_prob:.4f}")
 
-        return commands
+        scores.sort(key=lambda x: x[1], reverse=True)
+        best_scope = scores[0][0]
 
-    # 3. Target 추출
-    def _extract_target(self, text: str):
-        """대상 추출"""
-        numbers = [int(m) for m in re.findall(r'\d+', text)]
+        log(f"  현장/서버 : {best_scope}\n")
 
-        if not numbers:
-            if any(kw in text for kw in ["모두", "전체", "다", "all"]):
-                return {"type": "target", "values": list(range(1, 9))}
-            return None
+        return best_scope
 
-        if any(kw in text for kw in ["포트", "target"]):
-            target_type = "target"
-        elif any(kw in text for kw in ["채널", "channel", "ch"]):
-            target_type = "channel"
-        else:
-            target_type = "target"
+    """
+        장소명 추출 (하이브리드)
+    
+        Args:
+            text: "서버에서 소양강댐 데이터 호출"
+    
+        Returns:
+            "소양강댐" or None
+    """
+    def _extract_location(self, text: str) -> str:
+        log("[장소 추출]")
 
-        range_patterns = [
-            r'(\d+)\s*(?:번)?\s*(?:에서)\s*(\d+)\s*(?:번)?',
-            r'(\d+)\s*(?:번)?\s*(?:부터)\s*(\d+)\s*(?:번)?(?:\s*까지)?',
-            r'(\d+)\s*[~\-]\s*(\d+)',
+        # ========================================
+        # Step 1: 패턴 기반 추출 (빠른 처리)
+        # ========================================
+
+        # 패턴 1: "서버에서 [장소] ..."
+        pattern1 = r'서버에서\s+(\S+?)\s+(?:데이터|경보|장비|상태)'
+        match = re.search(pattern1, text)
+
+        if match:
+            candidate = match.group(1)
+            log(f"  패턴 후보: {candidate}")
+
+            # 2. 시설 키워드: 댐, 교, 국 등 접미사 검색
+            if any(kw in candidate for kw in ["댐", "교", "국"]):
+                log(f"  ✅ 시설명 확정: {candidate}")
+                return candidate
+
+            # 애매한 경우 AI 검증으로 넘김
+            else:
+                log(f"  ⚠️ 애매함 → AI 검증 필요")
+                return self._verify_location_with_ai(text, candidate)
+
+        # 3. AI 검증: 애매한 경우 NLI 모델로 확인
+        facility_patterns = [
+            r'(\S+댐 \S+교 \S+국)',
+            r'(\S+댐 \S+교)',
+            r'(\S+댐 \S+국)',
+            r'(\S+교 \S+국)',
+            r'(\S+댐)',
+            r'(\S+교)',
+            r'(\S+국)',
         ]
 
-        for pattern in range_patterns:
+        for pattern in facility_patterns:
             match = re.search(pattern, text)
             if match:
-                start, end = int(match.group(1)), int(match.group(2))
+                location = match.group(1)
+                log(f"  ✅ 시설 패턴: {location}")
+                return location
 
-                if start > end:
-                    start, end = end, start
+        # 4. AI 분류: 등록된 주요 장소 중 선택 (10개 이하 권장)
+        common_locations = [
+            "수위우량국",
+            "수위국",
+            "우량국",
+            "경보국",
+            "통신실"
+        ]
 
-                range_nums = set(range(start, end + 1))
+        return self._classify_location_ai(text, common_locations)
 
-                if "그리고" in text or "하고" in text:
-                    all_nums = range_nums.union(set(numbers))
-                    values = sorted(list(all_nums))
-                else:
-                    values = list(range(start, end + 1))
+    """
+        후보 장소명 AI 검증
 
-                log(f"  [범위 인식] {start}~{end} → {values}")
-                return {"type": target_type, "values": values}
+        Args:
+            text: 전체 문장
+            candidate: 추출된 후보 (예: "상수도")
 
-        log(f"  [개별 인식] {numbers}")
-        return {"type": target_type, "values": numbers}
+        Returns:
+            검증된 장소명 or None
+    """
+    def _verify_location_with_ai(self, text: str, candidate: str) -> str:
+        log(f"  [AI 검증] 후보: {candidate}")
 
-    # 4. Action 추출
-    def _extract_action(self, text: str, cmd_type: str):
-        """동작 추출"""
-        if cmd_type == "control":
-            if any(kw in text for kw in ["켜", "on", "start", "활성"]):
-                return {"action": "on"}
-            elif any(kw in text for kw in ["꺼", "끄", "off", "stop", "비활성"]):
-                return {"action": "off"}
+        hypothesis = f"이 문장에서 '{candidate}'는 특정 장소나 시설을 가리킵니다."
 
-        elif cmd_type == "query":
-            return {"action": "query"}
+        tokenizer = self.classifier.tokenizer
+        model = self.classifier.model
 
-        elif cmd_type == "read":
-            return {"action": "read"}
+        inputs = tokenizer(
+            text,                                   # premise: 사용자 원문 텍스트
+            hypothesis,                             # hypothesis: 레이블별 가설 문장
+            return_tensors="pt",                    # PyTorch 텐서로 반환
+            truncation=True,                        # 최대 길이를 초과하면 잘라낸다
+            max_length=self.MAX_LENGTH              # 문장쌍 총 길이 상한(모델 한계에 맞춤)
+        )
 
-        elif cmd_type == "write":
-            numbers = [int(m) for m in re.findall(r'\d+', text)]
-            if numbers:
-                target, value = self._extract_value_for_write(text, numbers)
-                return {"action": "write", "target": target}
+        with torch.no_grad():                       # 추론 모드(gradient 비계산)로 메모리/속도 절약
+            outputs = model(**inputs)               # NLI 모델 전향 패스(forward) 호출
+            logits = outputs.logits[0]              # 배치 첫 항목의 로짓 벡터 취득
+            probs = torch.softmax(logits, dim=0)    # 로짓을 소프트맥스로 확률로 변환
+            entailment_prob = probs[-1].item()      # 마지막 인덱스를 함의(entailment)로 가정해 확률 추출
+
+        log(f"    확률: {entailment_prob:.4f}")
+
+        # 임계값 설정
+        if entailment_prob > 0.7:
+            log(f"  ✅ 검증 성공: {candidate}")
+            return candidate
+        else:
+            log(f"  ❌ 검증 실패")
             return None
 
-        elif cmd_type == "status":
-            return {"action": "status"}
+    """
+        등록된 장소 중 AI 분류
 
-        elif cmd_type == "log":
-            return {"action": "log"}
+        Args:
+            text: 입력 문장
+            candidates: 후보 장소 목록 (작은 리스트만!)
 
-    def _parse_single_command_with_what(self, text: str, forced_what: str = None):
-        """단일 명령 분석"""
-        cmd_type = self._classify_command_type(text)
-        log(f"  타입: {cmd_type}")
+        Returns:
+            가장 적합한 장소 or None
+    """
+    def _classify_location_ai(self, text: str, candidates: list) -> str:
+        log(f"  [AI 분류] 후보: {candidates}")
 
-        if forced_what:
-            what = forced_what
+        tokenizer = self.classifier.tokenizer
+        model = self.classifier.model
+
+        # "장소 없음" 케이스 추가
+        candidates_with_none = candidates + ["없음"]
+
+        hypotheses = {
+            loc: f"이 문장은 {loc}와 관련된 명령입니다."
+            for loc in candidates
+        }
+        hypotheses["없음"] = "이 문장에는 특정 장소가 언급되지 않았습니다."
+
+        scores = []
+
+        for loc, hypothesis in hypotheses.items():
+            # hypotheses 딕셔너리에서 (레이블코드/키, 가설문) 쌍을 한 개씩 가져온다. 예: ("ALERT", "이 문장은 경보...")
+            inputs = tokenizer(
+                text,                         # premise: 사용자 원문 텍스트
+                hypothesis,                   # hypothesis: 레이블별 가설 문장
+                return_tensors="pt",          # PyTorch 텐서로 반환
+                truncation=True,              # 최대 길이를 초과하면 잘라낸다
+                max_length=self.MAX_LENGTH    # 문장쌍 총 길이 상한(모델 한계에 맞춤)
+            )
+
+            with torch.no_grad():                      # 추론 모드(gradient 비계산)로 메모리/속도 절약
+                outputs = model(**inputs)              # NLI 모델 전향 패스(forward) 호출
+                logits = outputs.logits[0]             # 배치 첫 항목의 로짓 벡터 취득
+                probs = torch.softmax(logits, dim=0)   # 로짓을 소프트맥스로 확률로 변환
+                entailment_prob = probs[-1].item()     # 마지막 인덱스를 함의(entailment)로 가정해 확률 추출
+
+            scores.append((loc, entailment_prob))
+            log(f"    {loc:15s} → {entailment_prob:.4f}")
+
+        scores.sort(key=lambda x: x[1], reverse=True)
+        best_location = scores[0][0]
+
+        if best_location == "없음":
+            log("  ✅ 추론 결과: 장소 없음")
+            return None
         else:
-            what = self._extract_what(text)
-            log(f"  장치: {what}")
+            log(f"  ✅ 추론 결과: {best_location}")
+            return best_location
 
-        if not what:
-            return {"error": "장치를 인식하지 못했습니다."}
+    """
+                텍스트 분석 - Intent & Slot 기반 파싱
 
-        action = self._extract_action(text, cmd_type)
+                Args:
+                    text: 사용자 입력 텍스트
 
-        if cmd_type == "write" and action and "target" in action:
-            command = {
-                "type": cmd_type,
-                "what": what,
-                "target": action["target"],
-                "action": action["action"],
-            }
-            log(f"  포트: {action['target']}")
-            log(f"  값: {action['value']}")
-            return command
-
-
-        target = self._extract_target(text)
-
-        if not target:
-            print("타켓을 찾을 수 없습니다. 건너 뜁니다.")
-            # return {"error": "대상을 찾을 수 없습니다."}
-
-        else:
-            log(f"  {target['type']}: {target['values']}")
-
-        if not action:
-            print("동작을 인식할 수 없습니다. 건너 뜁니다.")
-            # return {"error": "동작을 인식하지 못했습니다."}
-
-        command = {"type": cmd_type, "what": what}
-
-        if target and len(target['values']) == 1:
-            command[target['type']] = target['values'][0]
-            command.update(action)
-
-        return command
-
-    def _parse_single_command(self, text: str):
-        """단일 명령 분석"""
-
-        keywords = self._extract_keywords(text, 5)
-        log(f"  [키워드] : {keywords}")
-
-        return self._parse_single_command_with_what(keywords, forced_what=None)
-
+                Returns:
+                    dict: 파싱 결과 {intent, slots, ...}
+            """
 
     def parse_text(self, text: str):
-        """텍스트 분석 (다중 명령 지원)"""
+
         if not text or not text.strip():
             return {"error": "입력된 텍스트가 없습니다."}
 
         log(f"[감지한 텍스트] {text}")
         log("=" * 60)
 
-        # if any(kw in text for kw in ["끄고", "켜고", "하고", "다음에"]):
-        #     log("[다중 명령 감지]")
-        #
-        #     common_what = self._extract_what(text)
-        #     log(f"  공통 장치: {common_what}")
-        #
-        #     commands_text = self._split_commands(text)
-        #     log(f"  분리된 명령: {len(commands_text)}개")
-        #
-        #     results = []
-        #     last_what = common_what
+        # 전처리
+        text = self._preprocess(text)
 
-            # log("=" * 60)
-            #
-            # if len(results) == 0:
-            #     return {"error": "유효한 명령을 찾을 수 없습니다."}
-            # elif len(results) == 1:
-            #     return results[0]
-            # else:
-            #     return {"명령어": results, "명령 개수": len(results)}
-            #
-            # for i, cmd_text in enumerate(commands_text, 1):
-            #     log(f"[명령 {i}] {cmd_text}")
-            #
-            #     what = self._extract_what(cmd_text)
-            #
-            #     if not what:
-            #         what = last_what
-            #         log(f"  장치: {what} (상속됨)")
-            #     else:
-            #         last_what = what
-            #         log(f"  장치: {what}")
-            #
-            #     if not what:
-            #         log(f"  ⚠️ 장치를 찾을 수 없어 스킵합니다.")
-            #         continue
-            #
-            #     result = self._parse_single_command_with_what(cmd_text, what)
-            #
-            #     if "error" not in result:
-            #         results.append(result)
+        # 키워드 추출 (디버깅용)
+        keywords = self._extract_keywords(text)
+        log(f"  [키워드] {keywords}")
 
-        what = self._extract_what(text)
-        log(f"  장치: {what}")
+        # 1단계: Intent 분류
+        try:
+            intent = self._classify_intent(text)
+        except Exception as e:
+            log(f"  [Intent 분류 실패] {e}")
+            return {"error": "명령을 인식하지 못했습니다."}
 
-        if not what:
-            log(f"  ⚠️ 장치를 찾을 수 없어 스킵합니다.")
+        # 2단계: Slot 추출
+        try:
+            slots = self._extract_slots(text, intent)
+        except Exception as e:
+            log(f"  [Slot 추출 실패] {e}")
+            return {"error": "파라미터를 추출하지 못했습니다."}
 
-        result = self._parse_single_command(text)
+        # 3단계: 최종 결과 구성
+        result = {
+            "intent": intent,
+            "slots": slots,
+        }
+
+        # 특수 처리: 방송 명령의 경우 파일 매핑
+        if intent == "alert.broadcast.start" and "scenario" in slots:
+            scenario = slots["scenario"]
+            if scenario in self.SCENARIO_TO_FILE:
+                result["file"] = self.SCENARIO_TO_FILE[scenario]
+                log(f"  [파일 매핑] {scenario} → {result['file']}")
 
         log("=" * 60)
         return result
+
