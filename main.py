@@ -78,18 +78,21 @@ def main():
     print("  q. 종료\n")
 
     while True:
-        choice = input("선택 (1/2/q): ").strip()
-        if choice == '1':
-            voice_mode()
-            break
-        elif choice == '2':
-            text_mode()
-            break
-        elif choice.lower() in ['q', 'quit', '종료']:
-            print("\n👋 종료")
-            break
-        else:
-            print("⚠️  1, 2, 또는 q 입력")
+        text_mode()
+
+    # while True:
+    #     choice = input("선택 (1/2/q): ").strip()
+    #     if choice == '1':
+    #         voice_mode()
+    #         break
+    #     elif choice == '2':
+    #         text_mode()
+    #         break
+    #     elif choice.lower() in ['q', 'quit', '종료']:
+    #         print("\n👋 종료")
+    #         break
+    #     else:
+    #         print("⚠️  1, 2, 또는 q 입력")
 
 if __name__ == "__main__":
     main()
